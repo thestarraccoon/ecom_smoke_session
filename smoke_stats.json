@@ -1,16 +1,30 @@
 {
   "-1002305306233": {
-    "stats_total_breaks": 1,
-    "stats_total_seconds": 326,
-    "stats_votes_won": 0,
-    "stats_votes_lost": 0,
-    "stats_today_breaks": 1,
+    "stats_total_breaks": 10,
+    "stats_total_seconds": 1542,
+    "stats_votes_won": 4,
+    "stats_votes_lost": 1,
+    "stats_today_breaks": 10,
     "stats_today_date": "2026-05-26",
     "stats_users": {
       "Максим": {
+        "count": 10,
+        "seconds": 1542
+      },
+      "Дмитрий": {
+        "count": 3,
+        "seconds": 54
+      },
+      "Илья": {
         "count": 1,
-        "seconds": 326
+        "seconds": 600
       }
-    }
+    },
+    "stats_shop_total": 0,
+    "stats_shop_today": 0,
+    "stats_shop_today_date": "2026-05-26",
+    "stats_shop_initiated": {},
+    "stats_shop_goers": {},
+    "next_smoke": "2026-05-26T18:52:00.204814"
   }
 }

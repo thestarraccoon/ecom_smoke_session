@@ -110,6 +110,12 @@ def _save_stats():
             "stats_today_breaks": state["stats_today_breaks"],
             "stats_today_date": state["stats_today_date"].isoformat(),
             "stats_users": state["stats_users"],
+            "stats_shop_total": state["stats_shop_total"],
+            "stats_shop_today": state["stats_shop_today"],
+            "stats_shop_today_date": state["stats_shop_today_date"].isoformat(),
+            "stats_shop_initiated": state["stats_shop_initiated"],
+            "stats_shop_goers": state["stats_shop_goers"],
+            "next_smoke": state["next_smoke"].isoformat() if state["next_smoke"] else None,
         }
     try:
         with open(STATS_FILE, "w", encoding="utf-8") as f:
@@ -125,6 +131,32 @@ def _init_stats_from_saved(state: dict, saved: dict):
     state["stats_votes_lost"] = saved.get("stats_votes_lost", 0)
     state["stats_today_breaks"] = saved.get("stats_today_breaks", 0)
     state["stats_users"] = saved.get("stats_users", {})
+    state["stats_shop_total"] = saved.get("stats_shop_total", 0)
+    state["stats_shop_initiated"] = saved.get("stats_shop_initiated", {})
+    state["stats_shop_goers"] = saved.get("stats_shop_goers", {})
+    next_smoke_str = saved.get("next_smoke")
+    if next_smoke_str:
+        try:
+            ns = datetime.fromisoformat(next_smoke_str)
+            state["next_smoke"] = ns if ns > datetime.now() else None
+        except ValueError:
+            state["next_smoke"] = None
+    else:
+        state["next_smoke"] = None
+    state["stats_shop_today"] = saved.get("stats_shop_today", 0)
+    shop_today_str = saved.get("stats_shop_today_date")
+    if shop_today_str:
+        try:
+            shop_saved_date = date.fromisoformat(shop_today_str)
+            if shop_saved_date != datetime.now().date():
+                state["stats_shop_today"] = 0
+                state["stats_shop_today_date"] = datetime.now().date()
+            else:
+                state["stats_shop_today_date"] = shop_saved_date
+        except ValueError:
+            state["stats_shop_today_date"] = datetime.now().date()
+    else:
+        state["stats_shop_today_date"] = datetime.now().date()
     today_str = saved.get("stats_today_date")
     if today_str:
         try:
@@ -178,9 +210,11 @@ def get_state(chat_id: int) -> dict:
             "countdown_task": None,
             "countdown_msg_id": None,
             "break_smokers_names": set(),
+            "break_starter_id": None,   # user_id того кто запустил перекур
             "join_msg_id": None,
             # голосование
             "vote_active": False,
+            "vote_quorum": False,    # кворум набрался, перекур идёт
             "vote_yes": set(),
             "vote_yes_names": {},
             "vote_no": set(),
@@ -188,6 +222,7 @@ def get_state(chat_id: int) -> dict:
             "vote_task": None,
             "vote_duration": DEFAULT_BREAK_MINUTES,
             "vote_proposer": "Кто-то",
+            "vote_starter_id": None,
             # статистика
             "stats_total_breaks": 0,
             "stats_total_seconds": 0,
@@ -196,6 +231,24 @@ def get_state(chat_id: int) -> dict:
             "stats_today_breaks": 0,
             "stats_today_date": datetime.now().date(),
             "stats_users": {},
+            # статистика магазина
+            "stats_shop_total": 0,
+            "stats_shop_today": 0,
+            "stats_shop_today_date": datetime.now().date(),
+            "stats_shop_initiated": {},   # name -> count
+            "stats_shop_goers": {},       # name -> count
+            # магазин
+            "shop_active": False,
+            "shop_vote_active": False,
+            "shop_vote_quorum": False,
+            "shop_yes": set(),
+            "shop_yes_names": {},
+            "shop_no": set(),
+            "shop_msg_id": None,
+            "shop_vote_task": None,
+            "shop_proposer": "Кто-то",
+            "shop_starter_id": None,
+            "shop_goers_names": set(),
         }
         if chat_id in _saved_stats:
             _init_stats_from_saved(state, _saved_stats[chat_id])
@@ -218,13 +271,43 @@ def _build_join_keyboard():
     ]])
 
 
-def _vote_text(proposer: str, duration: int, yes: int, no: int) -> str:
-    return (
-        f"🗳 *{md_escape(proposer)}* предлагает перекур на *{duration} мин*!\n\n"
-        f"Нужно *{VOTES_NEEDED} голоса* За.\n"
-        f"За: *{yes}*   Против: *{no}*\n\n"
-        f"Голосование закроется через 3 минуты."
-    )
+def _build_shop_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛒 Иду!", callback_data="shop_yes"),
+        InlineKeyboardButton("😴 Не пойду", callback_data="shop_no"),
+    ]])
+
+
+def _shop_vote_text(proposer: str, yes_names: list, no: int,
+                    quorum: bool = False) -> str:
+    names_str = ", ".join(md_escape(n) for n in yes_names) if yes_names else "пока никого"
+    yes = len(yes_names)
+    if quorum:
+        header = "Поход в магазин начался!"
+        goers_line = f"\nИдут в магазин ({yes}): *{names_str}*"
+        footer = "Нажми «Иду!» чтобы присоединиться."
+    else:
+        header = f"*{md_escape(proposer)}* предлагает сходить в магазин!"
+        goers_line = f"\nИдут ({yes}): *{names_str}*"
+        footer = f"Нужно *{VOTES_NEEDED}* голоса. Против: *{no}*\nГолосование закроется через 3 минуты."
+    return f"{header}{goers_line}\n\n{footer}"
+
+
+def _vote_text(proposer: str, duration: int, yes_names: list,
+               no: int, quorum: bool = False, break_end_str: str = "") -> str:
+    names_str = ", ".join(md_escape(n) for n in yes_names) if yes_names else "пока никого"
+    yes = len(yes_names)
+
+    if quorum:
+        header = f"Перекур идёт до *{break_end_str}*!"
+        smokers_line = f"\nИдут курить ({yes}): *{names_str}*"
+        footer = "Нажми «Лес гооу» чтобы присоединиться."
+    else:
+        header = f"*{md_escape(proposer)}* предлагает перекур на *{duration} мин*!"
+        smokers_line = f"\nЗа ({yes}): *{names_str}*"
+        footer = f"Нужно *{VOTES_NEEDED}* голоса. Против: *{no}*\nГолосование закроется через 3 минуты."
+
+    return f"{header}{smokers_line}\n\n{footer}"
 
 
 def _join_text(state: dict) -> str:
@@ -261,6 +344,7 @@ async def smoke_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Инициатор автоматически идёт курить
     state["break_smokers_names"] = {user}
+    state["break_starter_id"] = update.effective_user.id
     _ensure_user(state, user)
 
     await _start_break(context, chat_id, duration, started_by=user,
@@ -318,10 +402,9 @@ async def _remind_end(context, chat_id: int):
         chat_id=chat_id,
         text=(
             f"🏁 Перекур окончен! Курили от звонка до звонка — молодцы! 💪\n"
-            f"⏱ Время перекура: *{fmt_seconds(actual_seconds)}*\n\n"
+            f"⏱ Время перекура: {fmt_seconds(actual_seconds)}\n\n"
             f"⏭ Следующий через 1 час — /next_smoke"
         ),
-        parse_mode="Markdown",
     )
 
 
@@ -381,18 +464,20 @@ async def vote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     state["vote_active"] = True
+    state["vote_quorum"] = False
     state["vote_yes"] = set()
     state["vote_yes_names"] = {}
     state["vote_no"] = set()
     state["vote_duration"] = duration
     state["vote_proposer"] = user
+    state["vote_starter_id"] = update.effective_user.id
     state["break_smokers_names"] = set()
 
     _ensure_user(state, user)
     _save_stats()
 
     msg = await update.message.reply_text(
-        _vote_text(user, duration, 0, 0),
+        _vote_text(user, duration, [], 0),
         parse_mode="Markdown",
         reply_markup=_build_vote_keyboard(),
     )
@@ -409,6 +494,35 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = query.from_user.first_name
     state = get_state(chat_id)
 
+    # ── После кворума: кнопка «Лес гооу» = присоединиться, «Не хочу» игнорируется ──
+    if state["vote_quorum"]:
+        if query.data == "vote_no":
+            await query.answer()
+            return
+
+        if user_name in state["break_smokers_names"]:
+            await query.answer("Ты уже идёшь!", show_alert=True)
+            return
+
+        state["break_smokers_names"].add(user_name)
+        _ensure_user(state, user_name)
+        await query.answer(f"Ты в деле, {user_name}!")
+
+        break_end_str = state["break_end"].strftime("%H:%M:%S") if state["break_end"] else "?"
+        try:
+            await query.edit_message_text(
+                _vote_text(state["vote_proposer"], state["vote_duration"],
+                           sorted(state["break_smokers_names"]),
+                           0, quorum=True, break_end_str=break_end_str),
+                parse_mode="Markdown",
+                reply_markup=_build_vote_keyboard(),
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"Vote join edit failed: {e}")
+        return
+
+    # ── Голосование ещё идёт ──
     if not state["vote_active"]:
         await query.answer("Голосование уже закончилось.", show_alert=True)
         return
@@ -426,59 +540,78 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    yes = len(state["vote_yes"])
+    yes_names = list(state["vote_yes_names"].values())
     no = len(state["vote_no"])
     duration = state["vote_duration"]
     proposer = state["vote_proposer"]
 
-    # Победа «за»
-    if yes >= VOTES_NEEDED:
+    # Победа «за» — кворум набрался
+    if len(yes_names) >= VOTES_NEEDED:
+        logger.info(f"QUORUM: vote_yes_names={state['vote_yes_names']}, yes_names={yes_names}")
         state["vote_active"] = False
+        state["vote_quorum"] = True
         _cancel_task(state, "vote_task")
         state["stats_votes_won"] += 1
         state["break_smokers_names"] = set(state["vote_yes_names"].values())
+        state["break_starter_id"] = state.get("vote_starter_id")
         for name in state["break_smokers_names"]:
             _ensure_user(state, name)
         _save_stats()
 
-        await query.edit_message_text(
-            f"*{yes} из {VOTES_NEEDED}* проголосовали За — перекур одобрен!\n"
-            f"Стартуем на *{duration} мин*!",
-            parse_mode="Markdown",
-        )
-
+        # Запустить перекур
         async def send(text, **kw):
             await context.bot.send_message(chat_id=chat_id, text=text, **kw)
 
         await _start_break(context, chat_id, duration,
                            started_by="Голосование", reply_func=send, show_join=False)
+
+        # Обновить сообщение голосования — оставить кнопки, показать идущих
+        break_end_str = state["break_end"].strftime("%H:%M:%S") if state["break_end"] else "?"
+        try:
+            await query.edit_message_text(
+                _vote_text(proposer, duration, sorted(state["break_smokers_names"]),
+                           0, quorum=True, break_end_str=break_end_str),
+                parse_mode="Markdown",
+                reply_markup=_build_vote_keyboard(),
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"Vote quorum edit failed: {e}")
         return
 
     # Победа «против»
     if no >= VOTES_NEEDED:
         state["vote_active"] = False
+        state["vote_quorum"] = False
         _cancel_task(state, "vote_task")
         state["stats_votes_lost"] += 1
         _save_stats()
 
-        await query.edit_message_text(
-            f"*{no}* проголосовали Против — перекур отменён! Работаем",
-            parse_mode="Markdown",
-        )
+        try:
+            await query.edit_message_text(
+                f"*{no}* проголосовали Против — перекур отменён! Работаем",
+                parse_mode="Markdown",
+            )
+        except BadRequest as e:
+            logger.warning(f"Vote against edit failed: {e}")
         return
 
-    # Голосование продолжается
-    await query.edit_message_text(
-        _vote_text(proposer, duration, yes, no),
-        parse_mode="Markdown",
-        reply_markup=_build_vote_keyboard(),
-    )
+    # Голосование продолжается — обновить имена
+    try:
+        await query.edit_message_text(
+            _vote_text(proposer, duration, yes_names, no),
+            parse_mode="Markdown",
+            reply_markup=_build_vote_keyboard(),
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"Vote update edit failed: {e}")
 
 
 async def _vote_timeout(context, chat_id: int, msg_id: int):
     await asyncio.sleep(VOTE_TIMEOUT_SECONDS)
     state = get_state(chat_id)
-    if not state["vote_active"]:
+    if not state["vote_active"] or state["vote_quorum"]:
         return
 
     state["vote_active"] = False
@@ -508,6 +641,10 @@ async def smoke_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активного перекура.")
         return
 
+    if state.get("break_starter_id") and update.effective_user.id != state["break_starter_id"]:
+        await update.message.reply_text("Только тот кто начал перекур может его остановить.")
+        return
+
     _cancel_task(state, "end_task")
 
     actual_seconds = _elapsed_seconds(state)
@@ -518,9 +655,8 @@ async def smoke_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🛑 Перекур окончен!\n"
-        f"⏱ Покурили за: *{fmt_seconds(actual_seconds)}*\n\n"
+        f"⏱ Покурили за: {fmt_seconds(actual_seconds)}\n\n"
         f"⏭ Следующий через 1 час — /next_smoke",
-        parse_mode="Markdown",
     )
 
 
@@ -628,7 +764,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = {k: v for k, v in state["stats_users"].items() if v.get("count", 0) > 0}
 
     if users:
-        top = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)
+        top = sorted(users.items(), key=lambda x: x[1]["seconds"], reverse=True)
         medals = ["🥇", "🥈", "🥉"]
         top_lines = "\n🏆 *Кто больше всех курит:*\n" + "\n".join(
             f"  {medals[i] if i < 3 else '•'} {md_escape(name)} — "
@@ -638,6 +774,42 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         top_lines = ""
 
+    # Статистика магазина
+    shop_total = state["stats_shop_total"]
+    shop_today = state["stats_shop_today"]
+    shop_initiated = {k: v for k, v in state["stats_shop_initiated"].items() if v > 0}
+    shop_goers = {k: v for k, v in state["stats_shop_goers"].items() if v > 0}
+
+    if shop_initiated:
+        shop_init_top = sorted(shop_initiated.items(), key=lambda x: x[1], reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        shop_init_lines = "\n🏆 *Кто чаще всех предлагал магазин:*\n" + "\n".join(
+            f"  {medals[i] if i < 3 else '•'} {md_escape(name)} — {count} раз"
+            for i, (name, count) in enumerate(shop_init_top[:5])
+        )
+    else:
+        shop_init_lines = ""
+
+    if shop_goers:
+        shop_goers_top = sorted(shop_goers.items(), key=lambda x: x[1], reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        shop_goers_lines = "\n🛒 *Кто чаще всех ходил в магазин:*\n" + "\n".join(
+            f"  {medals[i] if i < 3 else '•'} {md_escape(name)} — {count} раз"
+            for i, (name, count) in enumerate(shop_goers_top[:5])
+        )
+    else:
+        shop_goers_lines = ""
+
+    shop_block = ""
+    if shop_total > 0 or shop_init_lines or shop_goers_lines:
+        shop_block = (
+            f"\n\n🏪 *Статистика магазина*\n\n"
+            f"Сегодня: *{shop_today}* походов\n"
+            f"Всего: *{shop_total}* походов"
+            f"{shop_init_lines}"
+            f"{shop_goers_lines}"
+        )
+
     text = (
         f"📊 *Статистика перекуров*\n\n"
         f"Сегодня: *{today}* перекуров\n"
@@ -646,9 +818,209 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Голосований выиграно: *{won}*\n"
         f"Голосований провалено: *{lost}*\n"
         f"{top_lines}"
+        f"{shop_block}"
     )
 
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ─── МАГАЗИН ──────────────────────────────────────────────────────────────────
+
+async def shop_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
+    user = update.effective_user.first_name
+
+    if state["shop_active"]:
+        await update.message.reply_text("Поход в магазин уже идёт!")
+        return
+
+    if state["shop_vote_active"]:
+        await update.message.reply_text("Голосование за магазин уже идёт!")
+        return
+
+    state["shop_vote_active"] = True
+    state["shop_vote_quorum"] = False
+    state["shop_yes"] = set()
+    state["shop_yes_names"] = {}
+    state["shop_no"] = set()
+    state["shop_proposer"] = user
+    state["shop_starter_id"] = update.effective_user.id
+    state["shop_goers_names"] = {user}
+
+    # Записать инициатора
+    state["stats_shop_initiated"][user] = state["stats_shop_initiated"].get(user, 0) + 1
+    _save_stats()
+
+    msg = await update.message.reply_text(
+        _shop_vote_text(user, [user], 0),
+        parse_mode="Markdown",
+        reply_markup=_build_shop_keyboard(),
+    )
+    state["shop_msg_id"] = msg.message_id
+    state["shop_vote_task"] = asyncio.create_task(
+        _shop_vote_timeout(context, chat_id, msg.message_id)
+    )
+
+
+async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    user_name = query.from_user.first_name
+    state = get_state(chat_id)
+
+    # После кворума: «Иду!» = присоединиться, «Не пойду» игнорируется
+    if state["shop_vote_quorum"]:
+        if query.data == "shop_no":
+            await query.answer()
+            return
+
+        if user_name in state["shop_goers_names"]:
+            await query.answer("Ты уже идёшь!", show_alert=True)
+            return
+
+        state["shop_goers_names"].add(user_name)
+        state["stats_shop_goers"][user_name] = state["stats_shop_goers"].get(user_name, 0) + 1
+        _save_stats()
+        await query.answer(f"Ты в деле, {user_name}!")
+
+        try:
+            await query.edit_message_text(
+                _shop_vote_text(state["shop_proposer"],
+                                sorted(state["shop_goers_names"]),
+                                0, quorum=True),
+                parse_mode="Markdown",
+                reply_markup=_build_shop_keyboard(),
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"Shop join edit failed: {e}")
+        return
+
+    if not state["shop_vote_active"]:
+        await query.answer("Голосование уже закончилось.", show_alert=True)
+        return
+
+    # Снять предыдущий голос
+    state["shop_yes"].discard(user_id)
+    state["shop_yes_names"].pop(user_id, None)
+    state["shop_no"].discard(user_id)
+
+    if query.data == "shop_yes":
+        state["shop_yes"].add(user_id)
+        state["shop_yes_names"][user_id] = user_name
+    else:
+        state["shop_no"].add(user_id)
+
+    await query.answer()
+
+    yes_names = list(state["shop_yes_names"].values())
+    no = len(state["shop_no"])
+    proposer = state["shop_proposer"]
+
+    # Победа «за»
+    if len(yes_names) >= VOTES_NEEDED:
+        state["shop_vote_active"] = False
+        state["shop_vote_quorum"] = True
+        state["shop_active"] = True
+        _cancel_task(state, "shop_vote_task")
+        state["shop_goers_names"] = set(state["shop_yes_names"].values())
+
+        # Записать поход и участников
+        today = datetime.now().date()
+        if state["stats_shop_today_date"] != today:
+            state["stats_shop_today_date"] = today
+            state["stats_shop_today"] = 0
+        state["stats_shop_total"] += 1
+        state["stats_shop_today"] += 1
+        for name in state["shop_goers_names"]:
+            state["stats_shop_goers"][name] = state["stats_shop_goers"].get(name, 0) + 1
+        _save_stats()
+
+        try:
+            await query.edit_message_text(
+                _shop_vote_text(proposer, sorted(state["shop_goers_names"]),
+                                0, quorum=True),
+                parse_mode="Markdown",
+                reply_markup=_build_shop_keyboard(),
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"Shop quorum edit failed: {e}")
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Поход в магазин объявлен! Завершить: /shop_stop",
+        )
+        return
+
+    # Победа «против»
+    if no >= VOTES_NEEDED:
+        state["shop_vote_active"] = False
+        state["shop_vote_quorum"] = False
+        _cancel_task(state, "shop_vote_task")
+
+        try:
+            await query.edit_message_text(
+                f"*{no}* проголосовали Против — в магазин не идём!",
+                parse_mode="Markdown",
+            )
+        except BadRequest as e:
+            logger.warning(f"Shop against edit failed: {e}")
+        return
+
+    # Голосование продолжается
+    try:
+        await query.edit_message_text(
+            _shop_vote_text(proposer, yes_names, no),
+            parse_mode="Markdown",
+            reply_markup=_build_shop_keyboard(),
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"Shop vote update failed: {e}")
+
+
+async def _shop_vote_timeout(context, chat_id: int, msg_id: int):
+    await asyncio.sleep(VOTE_TIMEOUT_SECONDS)
+    state = get_state(chat_id)
+    if not state["shop_vote_active"] or state["shop_vote_quorum"]:
+        return
+
+    state["shop_vote_active"] = False
+    yes = len(state["shop_yes"])
+    no = len(state["shop_no"])
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=f"Время вышло. За: *{yes}*, Против: *{no}* — в магазин не идём",
+            parse_mode="Markdown",
+        )
+    except BadRequest as e:
+        logger.warning(f"Shop timeout edit failed: {e}")
+
+
+async def shop_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
+
+    if not state["shop_active"] and not state["shop_vote_active"]:
+        await update.message.reply_text("Нет активного похода в магазин.")
+        return
+
+    if state.get("shop_starter_id") and update.effective_user.id != state["shop_starter_id"]:
+        await update.message.reply_text("Только тот кто начал поход может его отменить.")
+        return
+
+    _cancel_task(state, "shop_vote_task")
+    state["shop_active"] = False
+    state["shop_vote_active"] = False
+    state["shop_vote_quorum"] = False
+
+    await update.message.reply_text("Поход в магазин отменён!")
 
 
 # ─── ПОМОЩЬ ───────────────────────────────────────────────────────────────────
@@ -662,8 +1034,82 @@ async def smoke_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/vote 15 — голосование за 15-минутный перекур\n"
         "/stop — остановить перекур досрочно\n"
         "/next_smoke — таймер до следующего перекура\n"
-        "/stats — статистика перекуров",
+        "/stats — статистика перекуров\n\n"
+        "/shop — голосование за поход в магазин\n"
+        "/shop_stop — отменить поход в магазин",
     )
+
+
+# ─── ЕЖЕДНЕВНЫЙ ПОДЫТОГ ───────────────────────────────────────────────────────
+
+def _daily_summary_text(state: dict) -> str | None:
+    """Сформировать текст подытога за сегодня. Вернуть None если активности не было."""
+    today_breaks = state["stats_today_breaks"]
+    today_shops = state["stats_shop_today"]
+
+    if today_breaks == 0 and today_shops == 0:
+        return None
+
+    lines = ["📋 *Итоги дня*\n"]
+
+    # Перекуры
+    if today_breaks > 0:
+        lines.append(f"🚬 Перекуров сегодня: *{today_breaks}*")
+
+        # Топ курильщиков за сегодня — берём из stats_users тех у кого count > 0
+        # (точный подсчёт за сегодня не ведём отдельно, показываем общий топ)
+        users = {k: v for k, v in state["stats_users"].items() if v.get("count", 0) > 0}
+        if users:
+            top = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)[:3]
+            medals = ["🥇", "🥈", "🥉"]
+            lines.append("Чаще всех курили: " + ", ".join(
+                f"{medals[i]} {md_escape(name)}"
+                for i, (name, _) in enumerate(top)
+            ))
+
+    # Магазин
+    if today_shops > 0:
+        lines.append(f"\n🛒 Походов в магазин: *{today_shops}*")
+
+        goers = {k: v for k, v in state["stats_shop_goers"].items() if v > 0}
+        if goers:
+            top = sorted(goers.items(), key=lambda x: x[1], reverse=True)[:3]
+            medals = ["🥇", "🥈", "🥉"]
+            lines.append("Чаще всех ходили: " + ", ".join(
+                f"{medals[i]} {md_escape(name)}"
+                for i, (name, _) in enumerate(top)
+            ))
+
+    return "\n".join(lines)
+
+
+async def _send_daily_summaries(app: Application):
+    """Отправить подытог во все чаты где была активность сегодня."""
+    for chat_id, state in list(chat_states.items()):
+        text = _daily_summary_text(state)
+        if text is None:
+            continue
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить подытог в чат {chat_id}: {e}")
+
+
+async def _daily_summary_loop(app: Application):
+    """Фоновая задача — каждый день в 18:00 отправляет подытог."""
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info(f"Следующий подытог через {wait_seconds:.0f} сек ({target.strftime('%Y-%m-%d %H:%M')})")
+        await asyncio.sleep(wait_seconds)
+        await _send_daily_summaries(app)
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -683,10 +1129,19 @@ def main():
     app.add_handler(CommandHandler("stop", smoke_stop))
     app.add_handler(CommandHandler("next_smoke", next_smoke))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("shop", shop_start))
+    app.add_handler(CommandHandler("shop_stop", shop_stop))
     app.add_handler(CommandHandler("start", smoke_help))
     app.add_handler(CommandHandler("help", smoke_help))
     app.add_handler(CallbackQueryHandler(vote_callback, pattern="^vote_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(join_callback, pattern="^join_smoke$"))
+    app.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop_(yes|no)$"))
+
+    # Запустить фоновый цикл подытога после старта приложения
+    async def post_init(application: Application):
+        asyncio.create_task(_daily_summary_loop(application))
+
+    app.post_init = post_init
 
     logger.info("Бот запущен! Нажми Ctrl+C для остановки.")
     app.run_polling()
