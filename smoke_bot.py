@@ -23,7 +23,6 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, date
-from collections import defaultdict
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -46,14 +45,30 @@ STATS_FILE = Path(__file__).parent / "smoke_stats.json"
 # ─── УТИЛИТЫ ──────────────────────────────────────────────────────────────────
 
 def md_escape(text: str) -> str:
-    """Экранировать спецсимволы Markdown v1: * _ ` ["""
+    """Экранировать спецсимволы Markdown v1."""
     return re.sub(r'([*_`\[])', r'\\\1', str(text))
 
 
 def fmt_delta(delta: timedelta) -> str:
+    """MM:SS для обратного отсчёта."""
     total = max(0, int(delta.total_seconds()))
     m, s = divmod(total, 60)
     return f"{m:02d}:{s:02d}"
+
+
+def fmt_seconds(seconds: int) -> str:
+    """Человекочитаемое время: 1 ч 5 мин 38 сек."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} ч")
+    if m:
+        parts.append(f"{m} мин")
+    if s or not parts:
+        parts.append(f"{s} сек")
+    return " ".join(parts)
 
 
 def _cancel_task(state: dict, key: str):
@@ -61,6 +76,13 @@ def _cancel_task(state: dict, key: str):
     if task and not task.done():
         task.cancel()
     state[key] = None
+
+
+def _elapsed_seconds(state: dict) -> int:
+    """Фактически прошедшее время перекура в секундах."""
+    if state.get("break_start") is None:
+        return state.get("break_duration", DEFAULT_BREAK_MINUTES) * 60
+    return max(0, int((datetime.now() - state["break_start"]).total_seconds()))
 
 
 # ─── СОХРАНЕНИЕ / ЗАГРУЗКА ────────────────────────────────────────────────────
@@ -82,12 +104,12 @@ def _save_stats():
     for chat_id, state in chat_states.items():
         data[str(chat_id)] = {
             "stats_total_breaks": state["stats_total_breaks"],
-            "stats_total_minutes": state["stats_total_minutes"],
-            "stats_initiated": dict(state["stats_initiated"]),
+            "stats_total_seconds": state["stats_total_seconds"],
             "stats_votes_won": state["stats_votes_won"],
             "stats_votes_lost": state["stats_votes_lost"],
             "stats_today_breaks": state["stats_today_breaks"],
             "stats_today_date": state["stats_today_date"].isoformat(),
+            "stats_users": state["stats_users"],
         }
     try:
         with open(STATS_FILE, "w", encoding="utf-8") as f:
@@ -98,11 +120,11 @@ def _save_stats():
 
 def _init_stats_from_saved(state: dict, saved: dict):
     state["stats_total_breaks"] = saved.get("stats_total_breaks", 0)
-    state["stats_total_minutes"] = saved.get("stats_total_minutes", 0)
-    state["stats_initiated"] = defaultdict(int, saved.get("stats_initiated", {}))
+    state["stats_total_seconds"] = saved.get("stats_total_seconds", 0)
     state["stats_votes_won"] = saved.get("stats_votes_won", 0)
     state["stats_votes_lost"] = saved.get("stats_votes_lost", 0)
     state["stats_today_breaks"] = saved.get("stats_today_breaks", 0)
+    state["stats_users"] = saved.get("stats_users", {})
     today_str = saved.get("stats_today_date")
     if today_str:
         try:
@@ -118,14 +140,25 @@ def _init_stats_from_saved(state: dict, saved: dict):
         state["stats_today_date"] = datetime.now().date()
 
 
-def _record_break_end(state: dict):
+def _ensure_user(state: dict, name: str):
+    """Создать запись пользователя в stats_users если её нет."""
+    if name not in state["stats_users"]:
+        state["stats_users"][name] = {"count": 0, "seconds": 0}
+
+
+def _record_break_end(state: dict, actual_seconds: int):
+    """Обновить общие счётчики и записать время каждому участнику."""
     today = datetime.now().date()
     if state["stats_today_date"] != today:
         state["stats_today_date"] = today
         state["stats_today_breaks"] = 0
     state["stats_total_breaks"] += 1
     state["stats_today_breaks"] += 1
-    state["stats_total_minutes"] += state["break_duration"]
+    state["stats_total_seconds"] += actual_seconds
+    for name in state.get("break_smokers_names", set()):
+        _ensure_user(state, name)
+        state["stats_users"][name]["count"] += 1
+        state["stats_users"][name]["seconds"] += actual_seconds
     _save_stats()
 
 
@@ -138,27 +171,31 @@ def get_state(chat_id: int) -> dict:
             # перекур
             "break_active": False,
             "break_end": None,
+            "break_start": None,
             "next_smoke": None,
             "break_duration": DEFAULT_BREAK_MINUTES,
             "end_task": None,
             "countdown_task": None,
             "countdown_msg_id": None,
+            "break_smokers_names": set(),
+            "join_msg_id": None,
             # голосование
             "vote_active": False,
             "vote_yes": set(),
+            "vote_yes_names": {},
             "vote_no": set(),
             "vote_msg_id": None,
             "vote_task": None,
             "vote_duration": DEFAULT_BREAK_MINUTES,
-            "vote_proposer": "Кто-то",  # всегда присутствует
+            "vote_proposer": "Кто-то",
             # статистика
             "stats_total_breaks": 0,
-            "stats_total_minutes": 0,
-            "stats_initiated": defaultdict(int),
+            "stats_total_seconds": 0,
             "stats_votes_won": 0,
             "stats_votes_lost": 0,
             "stats_today_breaks": 0,
             "stats_today_date": datetime.now().date(),
+            "stats_users": {},
         }
         if chat_id in _saved_stats:
             _init_stats_from_saved(state, _saved_stats[chat_id])
@@ -166,7 +203,7 @@ def get_state(chat_id: int) -> dict:
     return chat_states[chat_id]
 
 
-# ─── ГОЛОСОВАНИЕ — тексты и клавиатура ────────────────────────────────────────
+# ─── КЛАВИАТУРЫ И ТЕКСТЫ ──────────────────────────────────────────────────────
 
 def _build_vote_keyboard():
     return InlineKeyboardMarkup([[
@@ -175,12 +212,29 @@ def _build_vote_keyboard():
     ]])
 
 
+def _build_join_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚬 Айда!", callback_data="join_smoke"),
+    ]])
+
+
 def _vote_text(proposer: str, duration: int, yes: int, no: int) -> str:
     return (
         f"🗳 *{md_escape(proposer)}* предлагает перекур на *{duration} мин*!\n\n"
-        f"Нужно *{VOTES_NEEDED} голоса* «За».\n"
-        f"✅ За: *{yes}*   ❌ Против: *{no}*\n\n"
-        f"⏳ Голосование закроется через 3 минуты."
+        f"Нужно *{VOTES_NEEDED} голоса* За.\n"
+        f"За: *{yes}*   Против: *{no}*\n\n"
+        f"Голосование закроется через 3 минуты."
+    )
+
+
+def _join_text(state: dict) -> str:
+    """Текст сообщения с кнопкой Айда."""
+    end_time = state["break_end"].strftime("%H:%M:%S") if state["break_end"] else "?"
+    smokers = ", ".join(md_escape(n) for n in sorted(state["break_smokers_names"]))
+    return (
+        f"Перекур идёт до *{end_time}*\n\n"
+        f"Идут курить: *{smokers}*\n\n"
+        f"Остановить досрочно: /stop"
     )
 
 
@@ -192,7 +246,7 @@ async def smoke_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name
 
     if state["break_active"]:
-        await update.message.reply_text("🚬 Перекур уже идёт!")
+        await update.message.reply_text("Перекур уже идёт!")
         return
 
     duration = DEFAULT_BREAK_MINUTES
@@ -202,19 +256,21 @@ async def smoke_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if duration <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("⚠️ Укажи целое число минут, например: /smoke 15")
+            await update.message.reply_text("Укажи целое число минут, например: /smoke 15")
             return
 
-    async def reply(text, **kw):
-        await update.message.reply_text(text, **kw)
+    # Инициатор автоматически идёт курить
+    state["break_smokers_names"] = {user}
+    _ensure_user(state, user)
 
-    await _start_break(context, chat_id, duration, started_by=user, reply_func=reply)
-
-    state["stats_initiated"][user] += 1
+    await _start_break(context, chat_id, duration, started_by=user,
+                       reply_func=lambda t, **kw: update.message.reply_text(t, **kw),
+                       show_join=True)
     _save_stats()
 
 
-async def _start_break(context, chat_id: int, duration: int, started_by: str, reply_func):
+async def _start_break(context, chat_id: int, duration: int, started_by: str,
+                       reply_func, show_join: bool = False):
     state = get_state(chat_id)
 
     _cancel_task(state, "countdown_task")
@@ -223,39 +279,80 @@ async def _start_break(context, chat_id: int, duration: int, started_by: str, re
     now = datetime.now()
     state["break_active"] = True
     state["break_end"] = now + timedelta(minutes=duration)
+    state["break_start"] = now
     state["break_duration"] = duration
 
-    await reply_func(
+    text = (
         f"🚬 *{md_escape(started_by)}* объявил перекур!\n"
-        f"⏱ Длительность: *{duration} мин*\n"
-        f"🏁 Конец в: *{state['break_end'].strftime('%H:%M:%S')}*\n\n"
-        f"Остановить досрочно: /stop",
-        parse_mode="Markdown",
+        f"Длительность: *{duration} мин*\n"
+        f"Конец в: *{state['break_end'].strftime('%H:%M:%S')}*\n\n"
+        f"Остановить досрочно: /stop"
     )
 
-    state["end_task"] = asyncio.create_task(
-        _remind_end(context, chat_id, duration)
-    )
+    if show_join:
+        msg = await reply_func(text, parse_mode="Markdown",
+                               reply_markup=_build_join_keyboard())
+        state["join_msg_id"] = msg.message_id if msg else None
+    else:
+        await reply_func(text, parse_mode="Markdown")
+        state["join_msg_id"] = None
+
+    state["end_task"] = asyncio.create_task(_remind_end(context, chat_id))
 
 
-async def _remind_end(context, chat_id: int, minutes: int):
-    await asyncio.sleep(minutes * 60)
+async def _remind_end(context, chat_id: int):
     state = get_state(chat_id)
+    duration = state["break_duration"]
+    await asyncio.sleep(duration * 60)
+
     if not state["break_active"]:
         return
 
+    actual_seconds = _elapsed_seconds(state)
     state["break_active"] = False
     state["break_end"] = None
     state["next_smoke"] = datetime.now() + timedelta(hours=1)
-    _record_break_end(state)
+    _record_break_end(state, actual_seconds)
 
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "⏰ Перекур закончился! Все за работу! 💼\n\n"
-            "⏭ Следующий через 1 час — смотри таймер: /next_smoke"
+            f"🏁 Перекур окончен! Курили от звонка до звонка — молодцы! 💪\n"
+            f"⏱ Время перекура: *{fmt_seconds(actual_seconds)}*\n\n"
+            f"⏭ Следующий через 1 час — /next_smoke"
         ),
+        parse_mode="Markdown",
     )
+
+
+# ─── КНОПКА «АЙДА!» ───────────────────────────────────────────────────────────
+
+async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    user_name = query.from_user.first_name
+    state = get_state(chat_id)
+
+    if not state["break_active"]:
+        await query.answer("Перекур уже закончился.", show_alert=True)
+        return
+
+    if user_name in state["break_smokers_names"]:
+        await query.answer("Ты уже идёшь!", show_alert=True)
+        return
+
+    state["break_smokers_names"].add(user_name)
+    _ensure_user(state, user_name)
+    await query.answer(f"Ты в деле, {user_name}!")
+
+    try:
+        await query.edit_message_text(
+            _join_text(state),
+            parse_mode="Markdown",
+            reply_markup=_build_join_keyboard(),
+        )
+    except BadRequest as e:
+        logger.warning(f"Join edit failed: {e}")
 
 
 # ─── ГОЛОСОВАНИЕ ──────────────────────────────────────────────────────────────
@@ -266,11 +363,11 @@ async def vote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name
 
     if state["break_active"]:
-        await update.message.reply_text("🚬 Перекур уже идёт!")
+        await update.message.reply_text("Перекур уже идёт!")
         return
 
     if state["vote_active"]:
-        await update.message.reply_text("🗳 Голосование уже идёт!")
+        await update.message.reply_text("Голосование уже идёт!")
         return
 
     duration = DEFAULT_BREAK_MINUTES
@@ -280,14 +377,19 @@ async def vote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if duration <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("⚠️ Укажи целое число минут, например: /vote 15")
+            await update.message.reply_text("Укажи целое число минут, например: /vote 15")
             return
 
     state["vote_active"] = True
     state["vote_yes"] = set()
+    state["vote_yes_names"] = {}
     state["vote_no"] = set()
     state["vote_duration"] = duration
     state["vote_proposer"] = user
+    state["break_smokers_names"] = set()
+
+    _ensure_user(state, user)
+    _save_stats()
 
     msg = await update.message.reply_text(
         _vote_text(user, duration, 0, 0),
@@ -295,7 +397,6 @@ async def vote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_build_vote_keyboard(),
     )
     state["vote_msg_id"] = msg.message_id
-
     state["vote_task"] = asyncio.create_task(
         _vote_timeout(context, chat_id, msg.message_id)
     )
@@ -305,23 +406,25 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = query.message.chat_id
     user_id = query.from_user.id
+    user_name = query.from_user.first_name
     state = get_state(chat_id)
 
-    # Сначала проверяем — если голосование уже закрыто, отвечаем с алертом и выходим
     if not state["vote_active"]:
         await query.answer("Голосование уже закончилось.", show_alert=True)
         return
 
     # Снять предыдущий голос (можно переголосовать)
     state["vote_yes"].discard(user_id)
+    state["vote_yes_names"].pop(user_id, None)
     state["vote_no"].discard(user_id)
 
     if query.data == "vote_yes":
         state["vote_yes"].add(user_id)
+        state["vote_yes_names"][user_id] = user_name
     else:
         state["vote_no"].add(user_id)
 
-    await query.answer()  # подтверждаем нажатие без алерта
+    await query.answer()
 
     yes = len(state["vote_yes"])
     no = len(state["vote_no"])
@@ -333,11 +436,14 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["vote_active"] = False
         _cancel_task(state, "vote_task")
         state["stats_votes_won"] += 1
+        state["break_smokers_names"] = set(state["vote_yes_names"].values())
+        for name in state["break_smokers_names"]:
+            _ensure_user(state, name)
         _save_stats()
 
         await query.edit_message_text(
-            f"✅ *{yes} из {VOTES_NEEDED}* проголосовали «За» — перекур одобрен!\n"
-            f"🚬 Стартуем на *{duration} мин*!",
+            f"*{yes} из {VOTES_NEEDED}* проголосовали За — перекур одобрен!\n"
+            f"Стартуем на *{duration} мин*!",
             parse_mode="Markdown",
         )
 
@@ -345,7 +451,7 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=text, **kw)
 
         await _start_break(context, chat_id, duration,
-                           started_by="Голосование", reply_func=send)
+                           started_by="Голосование", reply_func=send, show_join=False)
         return
 
     # Победа «против»
@@ -356,12 +462,12 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_stats()
 
         await query.edit_message_text(
-            f"🚫 *{no}* проголосовали «Против» — перекур отменён! Работаем 💪",
+            f"*{no}* проголосовали Против — перекур отменён! Работаем",
             parse_mode="Markdown",
         )
         return
 
-    # Голосование продолжается — обновить счётчик
+    # Голосование продолжается
     await query.edit_message_text(
         _vote_text(proposer, duration, yes, no),
         parse_mode="Markdown",
@@ -385,10 +491,7 @@ async def _vote_timeout(context, chat_id: int, msg_id: int):
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
-            text=(
-                f"⏰ Время вышло. За: *{yes}*, Против: *{no}* — "
-                f"перекур не состоялся 😔"
-            ),
+            text=f"Время вышло. За: *{yes}*, Против: *{no}* — перекур не состоялся",
             parse_mode="Markdown",
         )
     except BadRequest as e:
@@ -406,14 +509,18 @@ async def smoke_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _cancel_task(state, "end_task")
+
+    actual_seconds = _elapsed_seconds(state)
     state["break_active"] = False
     state["break_end"] = None
     state["next_smoke"] = datetime.now() + timedelta(hours=1)
-    _record_break_end(state)
+    _record_break_end(state, actual_seconds)
 
     await update.message.reply_text(
-        "🛑 Перекур остановлен досрочно! Все за работу! 💪\n\n"
-        "⏭ Следующий через 1 час — /next_smoke"
+        f"🛑 Перекур окончен!\n"
+        f"⏱ Покурили за: *{fmt_seconds(actual_seconds)}*\n\n"
+        f"⏭ Следующий через 1 час — /next_smoke",
+        parse_mode="Markdown",
     )
 
 
@@ -427,17 +534,17 @@ async def next_smoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state["break_end"]:
             remaining = state["break_end"] - datetime.now()
             await update.message.reply_text(
-                f"🚬 Сейчас идёт перекур! Осталось *{fmt_delta(remaining)}*\n"
+                f"Сейчас идёт перекур! Осталось *{fmt_delta(remaining)}*\n"
                 f"Остановить: /stop",
                 parse_mode="Markdown",
             )
         else:
-            await update.message.reply_text("🚬 Сейчас идёт перекур!")
+            await update.message.reply_text("Сейчас идёт перекур!")
         return
 
     if not state["next_smoke"] or state["next_smoke"] <= datetime.now():
         await update.message.reply_text(
-            "❓ Следующий перекур не запланирован.\n"
+            "Следующий перекур не запланирован.\n"
             "Запусти /smoke или /vote"
         )
         return
@@ -446,12 +553,10 @@ async def next_smoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     remaining = state["next_smoke"] - datetime.now()
     msg = await update.message.reply_text(
-        f"⏭ *До следующего перекура:*\n\n"
-        f"⏱ `{fmt_delta(remaining)}`",
+        f"До следующего перекура:\n\n`{fmt_delta(remaining)}`",
         parse_mode="Markdown",
     )
     state["countdown_msg_id"] = msg.message_id
-
     state["countdown_task"] = asyncio.create_task(
         _countdown_ticker(context, chat_id, msg.message_id)
     )
@@ -466,47 +571,39 @@ async def _countdown_ticker(context, chat_id: int, msg_id: int):
             now = datetime.now()
 
             if state["break_active"]:
-                new_text = "🚬 *Перекур начался!*"
+                new_text = "Перекур начался!"
                 if new_text != last_text:
                     try:
                         await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=new_text,
-                            parse_mode="Markdown",
+                            chat_id=chat_id, message_id=msg_id, text=new_text,
                         )
                     except BadRequest as e:
                         logger.warning(f"Countdown final edit failed: {e}")
                 return
 
             if not state["next_smoke"] or state["next_smoke"] <= now:
-                new_text = "🔔 *Время перекура!* Запускай /smoke или /vote"
+                new_text = "Время перекура! Запускай /smoke или /vote"
                 if new_text != last_text:
                     try:
                         await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=new_text,
-                            parse_mode="Markdown",
+                            chat_id=chat_id, message_id=msg_id, text=new_text,
                         )
                     except BadRequest as e:
                         logger.warning(f"Countdown final edit failed: {e}")
                 return
 
             remaining = state["next_smoke"] - now
-            new_text = f"⏭ *До следующего перекура:*\n\n⏱ `{fmt_delta(remaining)}`"
+            new_text = f"До следующего перекура:\n\n`{fmt_delta(remaining)}`"
             if new_text != last_text:
                 try:
                     await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=new_text,
-                        parse_mode="Markdown",
+                        chat_id=chat_id, message_id=msg_id,
+                        text=new_text, parse_mode="Markdown",
                     )
                     last_text = new_text
                 except BadRequest as e:
                     if "not modified" in str(e).lower():
-                        last_text = new_text  # текст уже такой, просто обновим кэш
+                        last_text = new_text
                     else:
                         logger.warning(f"Countdown edit failed: {e}")
                         return
@@ -524,22 +621,19 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_state(chat_id)
 
     total = state["stats_total_breaks"]
-    total_min = state["stats_total_minutes"]
+    total_sec = state["stats_total_seconds"]
     today = state["stats_today_breaks"]
     won = state["stats_votes_won"]
     lost = state["stats_votes_lost"]
+    users = {k: v for k, v in state["stats_users"].items() if v.get("count", 0) > 0}
 
-    initiated = {k: v for k, v in state["stats_initiated"].items() if v > 0}
-
-    if initiated:
-        top = sorted(initiated.items(), key=lambda x: x[1], reverse=True)
-        top_lines = (
-            "\n🏆 *Кто чаще всех объявлял перекур:*\n" +
-            "\n".join(
-                f"  {'🥇' if i == 0 else '🥈' if i == 1 else '🥉' if i == 2 else '•'} "
-                f"{md_escape(name)} — {count} раз"
-                for i, (name, count) in enumerate(top[:5])
-            )
+    if users:
+        top = sorted(users.items(), key=lambda x: x[1]["count"], reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        top_lines = "\n🏆 *Кто больше всех курит:*\n" + "\n".join(
+            f"  {medals[i] if i < 3 else '•'} {md_escape(name)} — "
+            f"{data['count']} раз, {fmt_seconds(data['seconds'])}"
+            for i, (name, data) in enumerate(top[:5])
         )
     else:
         top_lines = ""
@@ -548,9 +642,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Статистика перекуров*\n\n"
         f"Сегодня: *{today}* перекуров\n"
         f"Всего: *{total}* перекуров\n"
-        f"Суммарно покурено: *{total_min} мин*\n\n"
-        f"🗳 Голосований выиграно: *{won}*\n"
-        f"🗳 Голосований провалено: *{lost}*\n"
+        f"Суммарно покурено: *{fmt_seconds(total_sec)}*\n\n"
+        f"Голосований выиграно: *{won}*\n"
+        f"Голосований провалено: *{lost}*\n"
         f"{top_lines}"
     )
 
@@ -561,7 +655,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def smoke_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚬 Бот перекуров — команды:\n\n"
+        "Бот перекуров — команды:\n\n"
         "/smoke — перекур на 10 мин\n"
         "/smoke 15 — перекур на 15 мин\n"
         "/vote — голосование за перекур (нужно 2 из 4)\n"
@@ -592,6 +686,7 @@ def main():
     app.add_handler(CommandHandler("start", smoke_help))
     app.add_handler(CommandHandler("help", smoke_help))
     app.add_handler(CallbackQueryHandler(vote_callback, pattern="^vote_(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(join_callback, pattern="^join_smoke$"))
 
     logger.info("Бот запущен! Нажми Ctrl+C для остановки.")
     app.run_polling()

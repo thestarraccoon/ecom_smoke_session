@@ -1,0 +1,16 @@
+{
+  "-1002305306233": {
+    "stats_total_breaks": 1,
+    "stats_total_seconds": 326,
+    "stats_votes_won": 0,
+    "stats_votes_lost": 0,
+    "stats_today_breaks": 1,
+    "stats_today_date": "2026-05-26",
+    "stats_users": {
+      "Максим": {
+        "count": 1,
+        "seconds": 326
+      }
+    }
+  }
+}
